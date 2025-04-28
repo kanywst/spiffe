@@ -1,0 +1,346 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spiffe-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spiffe-demo-server
+  namespace: spiffe-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spiffe-demo-client
+  namespace: spiffe-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spiffe-demo-server
+  namespace: spiffe-demo
+spec:
+  selector:
+    app: spiffe-demo-server
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spiffe-demo-server
+  namespace: spiffe-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spiffe-demo-server
+  template:
+    metadata:
+      labels:
+        app: spiffe-demo-server
+    spec:
+      serviceAccountName: spiffe-demo-server
+      containers:
+        - name: server
+          image: golang:1.20
+          command:
+            - "/bin/bash"
+            - "-c"
+            - |
+              mkdir -p /app
+              cd /app
+              cat > main.go <<EOF
+              $(cat /spiffe-demo/main.go)
+              EOF
+              cat > go.mod <<EOF
+              $(cat /spiffe-demo/go.mod)
+              EOF
+              go mod tidy
+              go build -o spiffe-demo
+              ./spiffe-demo server
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /tmp/agent.sock
+              readOnly: true
+            - name: spiffe-demo-code
+              mountPath: /spiffe-demo
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets/agent.sock
+            type: Socket
+        - name: spiffe-demo-code
+          configMap:
+            name: spiffe-demo-code
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spiffe-demo-client
+  namespace: spiffe-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spiffe-demo-client
+  template:
+    metadata:
+      labels:
+        app: spiffe-demo-client
+    spec:
+      serviceAccountName: spiffe-demo-client
+      containers:
+        - name: client
+          image: golang:1.20
+          command:
+            - "/bin/bash"
+            - "-c"
+            - |
+              mkdir -p /app
+              cd /app
+              cat > main.go <<EOF
+              $(cat /spiffe-demo/main.go)
+              EOF
+              cat > go.mod <<EOF
+              $(cat /spiffe-demo/go.mod)
+              EOF
+              go mod tidy
+              go build -o spiffe-demo
+              sleep 10 # サーバーの起動を待つ
+              ./spiffe-demo client
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /tmp/agent.sock
+              readOnly: true
+            - name: spiffe-demo-code
+              mountPath: /spiffe-demo
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets/agent.sock
+            type: Socket
+        - name: spiffe-demo-code
+          configMap:
+            name: spiffe-demo-code
+---
+# SPIRE登録エントリを作成するためのジョブ
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spire-registration
+  namespace: spire
+spec:
+  template:
+    spec:
+      serviceAccountName: spire-server
+      containers:
+        - name: registration
+          image: ghcr.io/spiffe/spire-server:1.6.3
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              # サーバーエントリの登録
+              /opt/spire/bin/spire-server entry create \
+                -spiffeID spiffe://example.org/server \
+                -parentID spiffe://example.org/spire/agent/k8s_psat/demo-cluster/spiffe-demo/spiffe-demo-server \
+                -selector k8s:ns:spiffe-demo \
+                -selector k8s:sa:spiffe-demo-server \
+                -ttl 3600
+
+              # クライアントエントリの登録
+              /opt/spire/bin/spire-server entry create \
+                -spiffeID spiffe://example.org/client \
+                -parentID spiffe://example.org/spire/agent/k8s_psat/demo-cluster/spiffe-demo/spiffe-demo-client \
+                -selector k8s:ns:spiffe-demo \
+                -selector k8s:sa:spiffe-demo-client \
+                -ttl 3600
+          volumeMounts:
+            - name: spire-socket
+              mountPath: /tmp/spire-server/private/api.sock
+              subPath: server.sock
+      restartPolicy: OnFailure
+      volumes:
+        - name: spire-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+---
+# サンプルアプリケーションのコードをConfigMapとして保存
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spiffe-demo-code
+  namespace: spiffe-demo
+data:
+  main.go: |
+    package main
+
+    import (
+      "context"
+      "crypto/tls"
+      "crypto/x509"
+      "fmt"
+      "io"
+      "log"
+      "net"
+      "net/http"
+      "os"
+      "time"
+
+      "github.com/spiffe/go-spiffe/v2/spiffeid"
+      "github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+      "github.com/spiffe/go-spiffe/v2/workloadapi"
+    )
+
+    const (
+      serverAddress = "spiffe-demo-server:8443"
+      socketPath    = "unix:///tmp/agent.sock" // SPIREエージェントのソケットパス
+    )
+
+    func main() {
+      if len(os.Args) != 2 {
+        log.Fatalf("Usage: %s [server|client]", os.Args[0])
+      }
+
+      switch os.Args[1] {
+      case "server":
+        runServer()
+      case "client":
+        runClient()
+      default:
+        log.Fatalf("Unknown mode: %s", os.Args[1])
+      }
+    }
+
+    // サーバーを実行する関数
+    func runServer() {
+      // SPIREワークロードAPIに接続
+      ctx, cancel := context.WithCancel(context.Background())
+      defer cancel()
+
+      source, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(socketPath)))
+      if err != nil {
+        log.Fatalf("Failed to connect to workload API: %v", err)
+      }
+      defer source.Close()
+
+      // サーバーのSPIFFE IDを取得
+      svid, err := source.GetX509SVID()
+      if err != nil {
+        log.Fatalf("Failed to get X.509-SVID: %v", err)
+      }
+      log.Printf("Server SPIFFE ID: %s", svid.ID)
+
+      // mTLS用のTLS設定を作成
+      tlsConfig := tlsconfig.MTLSServerConfig(source, source, tlsconfig.AuthorizeAny())
+      server := &http.Server{
+        Addr:      ":8443",
+        TLSConfig: tlsConfig,
+        Handler:   http.HandlerFunc(serverHandler),
+      }
+
+      // サーバーを起動
+      listener, err := net.Listen("tcp", ":8443")
+      if err != nil {
+        log.Fatalf("Failed to create listener: %v", err)
+      }
+
+      log.Printf("Server started: https://%s", serverAddress)
+      err = server.ServeTLS(listener, "", "")
+      if err != nil {
+        log.Fatalf("Server error: %v", err)
+      }
+    }
+
+    // HTTPリクエストを処理するハンドラー
+    func serverHandler(w http.ResponseWriter, r *http.Request) {
+      // クライアントのSPIFFE IDを取得
+      clientID := ""
+      if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+        cert := r.TLS.PeerCertificates[0]
+        if len(cert.URIs) > 0 {
+          clientID = cert.URIs[0].String()
+        }
+      }
+
+      log.Printf("Received request from client: %s", clientID)
+      fmt.Fprintf(w, "Hello, %s! The current time is %s.", clientID, time.Now().Format(time.RFC3339))
+    }
+
+    // クライアントを実行する関数
+    func runClient() {
+      // SPIREワークロードAPIに接続
+      ctx, cancel := context.WithCancel(context.Background())
+      defer cancel()
+
+      source, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(socketPath)))
+      if err != nil {
+        log.Fatalf("Failed to connect to workload API: %v", err)
+      }
+      defer source.Close()
+
+      // クライアントのSPIFFE IDを取得
+      svid, err := source.GetX509SVID()
+      if err != nil {
+        log.Fatalf("Failed to get X.509-SVID: %v", err)
+      }
+      log.Printf("Client SPIFFE ID: %s", svid.ID)
+
+      // サーバーのSPIFFE IDを指定
+      serverID, err := spiffeid.FromString("spiffe://example.org/server")
+      if err != nil {
+        log.Fatalf("Failed to parse server ID: %v", err)
+      }
+
+      // mTLS用のTLS設定を作成
+      tlsConfig := tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(serverID))
+      client := &http.Client{
+        Transport: &http.Transport{
+          TLSClientConfig: tlsConfig,
+        },
+      }
+
+      // サーバーにリクエストを送信
+      resp, err := client.Get(fmt.Sprintf("https://%s", serverAddress))
+      if err != nil {
+        log.Fatalf("Request error: %v", err)
+      }
+      defer resp.Body.Close()
+
+      // レスポンスを読み取り
+      body, err := io.ReadAll(resp.Body)
+      if err != nil {
+        log.Fatalf("Response read error: %v", err)
+      }
+
+      log.Printf("Response from server: %s", body)
+    }
+
+  go.mod: |
+    module github.com/example/spiffe-demo
+
+    go 1.20
+
+    require (
+      github.com/spiffe/go-spiffe/v2 v2.1.6
+    )
+
+    require (
+      github.com/Microsoft/go-winio v0.6.1 // indirect
+      github.com/go-jose/go-jose/v3 v3.0.0 // indirect
+      github.com/golang/protobuf v1.5.3 // indirect
+      github.com/zeebo/errs v1.3.0 // indirect
+      golang.org/x/crypto v0.12.0 // indirect
+      golang.org/x/mod v0.12.0 // indirect
+      golang.org/x/net v0.14.0 // indirect
+      golang.org/x/sys v0.11.0 // indirect
+      golang.org/x/text v0.12.0 // indirect
+      golang.org/x/tools v0.12.0 // indirect
+      google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d // indirect
+      google.golang.org/grpc v1.57.0 // indirect
+      google.golang.org/protobuf v1.31.0 // indirect
+    )
